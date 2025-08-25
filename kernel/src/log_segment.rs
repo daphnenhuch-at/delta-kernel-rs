@@ -1,548 +1,900 @@
-//! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
-//! files.
-use std::num::NonZero;
+use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
-use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{
-    get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SIDECAR_NAME,
-};
-use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::log_replay::ActionsBatch;
-use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::SchemaRef;
-use crate::utils::require;
-use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler, Version,
-};
-use delta_kernel_derive::internal_api;
-
-use crate::listed_log_files::*;
-
+use arrow_array::RecordBatch;
+use chrono::Utc;
+use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use tracing::{debug, warn};
-use url::Url;
+use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStore};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::ProjectionMask;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use tracing::debug;
 
-#[cfg(test)]
-mod tests;
+use super::parse;
+use crate::kernel::{arrow::json, ActionType, Metadata, Protocol, Schema, StructType};
+use crate::logstore::LogStore;
+use crate::operations::transaction::CommitData;
+use crate::{DeltaResult, DeltaTableConfig, DeltaTableError};
 
-/// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
-/// and commit files and guarantees the following:
-///     1. Commit file versions will not have any gaps between them.
-///     2. If checkpoint(s) is/are present in the range, only commits with versions greater than the most
-///        recent checkpoint version are retained. There will not be a gap between the checkpoint
-///        version and the first commit version.
-///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
-///        version. Multi-part checkpoints must have all their parts.
+const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
+
+static CHECKPOINT_FILE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d+\.checkpoint(\.\d+\.\d+)?\.parquet").unwrap());
+static DELTA_FILE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+\.json$").unwrap());
+static CRC_FILE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\.\d+(\.crc|\.json)|\d+)\.crc$").unwrap());
+pub(super) static TOMBSTONE_SCHEMA: LazyLock<StructType> =
+    LazyLock::new(|| StructType::new(vec![ActionType::Remove.schema_field().clone()]));
+
+/// Trait to extend a file path representation with delta specific functionality
 ///
-/// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
-/// and in `TableChanges` when built with [`LogSegment::for_table_changes`].
-///
-/// [`Snapshot`]: crate::snapshot::Snapshot
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[internal_api]
-pub(crate) struct LogSegment {
-    pub end_version: Version,
-    pub checkpoint_version: Option<Version>,
-    pub log_root: Url,
-    /// Sorted commit files in the log segment (ascending)
-    pub ascending_commit_files: Vec<ParsedLogPath>,
-    /// Sorted (by start version) compaction files in the log segment (ascending)
-    pub ascending_compaction_files: Vec<ParsedLogPath>,
-    /// Checkpoint files in the log segment.
-    pub checkpoint_parts: Vec<ParsedLogPath>,
-    /// Latest CRC (checksum) file
-    pub latest_crc_file: Option<ParsedLogPath>,
+/// specifically, this trait adds the ability to recognize valid log files and
+/// parse the version number from a log file path
+// TODO handle compaction files
+pub(crate) trait PathExt {
+    /// Returns the last path segment if not terminated with a "/"
+    fn filename(&self) -> Option<&str>;
+
+    /// Parse the version number assuming a commit json or checkpoint parquet file
+    fn commit_version(&self) -> Option<i64> {
+        self.filename()
+            .and_then(|f| f.split_once('.'))
+            .and_then(|(name, _)| name.parse().ok())
+    }
+
+    /// Returns true if the file is a checkpoint parquet file
+    fn is_checkpoint_file(&self) -> bool {
+        self.filename()
+            .map(|name| CHECKPOINT_FILE_PATTERN.captures(name).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Returns true if the file is a commit json file
+    fn is_commit_file(&self) -> bool {
+        self.filename()
+            .map(|name| DELTA_FILE_PATTERN.captures(name).is_some())
+            .unwrap_or(false)
+    }
+
+    fn is_crc_file(&self) -> bool {
+        self.filename()
+            .map(|name| CRC_FILE_PATTERN.captures(name).is_some())
+            .unwrap()
+    }
+}
+
+impl PathExt for Path {
+    fn filename(&self) -> Option<&str> {
+        self.filename()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct LogSegment {
+    pub(super) version: i64,
+    pub(super) commit_files: VecDeque<ObjectMeta>,
+    pub(super) checkpoint_files: Vec<ObjectMeta>,
 }
 
 impl LogSegment {
-    #[internal_api]
-    pub(crate) fn try_new(
-        listed_files: ListedLogFiles,
-        log_root: Url,
-        end_version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let ListedLogFiles {
-            mut ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-        } = listed_files;
-
-        // Ensure commit file versions are contiguous
-        require!(
-            ascending_commit_files
-                .windows(2)
-                .all(|cfs| cfs[0].version + 1 == cfs[1].version),
-            Error::generic(format!(
-                "Expected ordered contiguous commit files {ascending_commit_files:?}"
-            ))
-        );
-
-        // Commit file versions must be greater than the most recent checkpoint version if it exists
-        let checkpoint_version = checkpoint_parts.first().map(|checkpoint_file| {
-            ascending_commit_files.retain(|log_path| checkpoint_file.version < log_path.version);
-            checkpoint_file.version
-        });
-
-        // There must be no gap between a checkpoint and the first commit version. Note that
-        // that all checkpoint parts share the same version.
-        if let (Some(checkpoint_version), Some(commit_file)) =
-            (checkpoint_version, ascending_commit_files.first())
-        {
-            require!(
-                checkpoint_version + 1 == commit_file.version,
-                Error::InvalidCheckpoint(format!(
-                    "Gap between checkpoint version {} and next commit {}",
-                    checkpoint_version, commit_file.version,
-                ))
-            )
-        }
-
-        // Get the effective version from chosen files
-        let effective_version = ascending_commit_files
-            .last()
-            .or(checkpoint_parts.first())
-            .ok_or(Error::generic("No files in log segment"))?
-            .version;
-        if let Some(end_version) = end_version {
-            require!(
-                effective_version == end_version,
-                Error::generic(format!(
-                    "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
-                ))
-            );
-        }
-
-        Ok(LogSegment {
-            end_version: effective_version,
-            checkpoint_version,
-            log_root,
-            ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-        })
-    }
-
-    /// Constructs a [`LogSegment`] to be used for [`Snapshot`]. For a `Snapshot` at version `n`:
-    /// Its LogSegment is made of zero or one checkpoint, and all commits between the checkpoint up
-    /// to and including the end version `n`. Note that a checkpoint may be made of multiple
-    /// parts. All these parts will have the same checkpoint version.
+    /// Try to create a new [`LogSegment`]
     ///
-    /// The options for constructing a LogSegment for Snapshot are as follows:
-    /// - `checkpoint_hint`: a `LastCheckpointHint` to start the log segment from (e.g. from reading the `last_checkpoint` file).
-    /// - `time_travel_version`: The version of the log that the Snapshot will be at.
-    ///
-    /// [`Snapshot`]: crate::snapshot::Snapshot
-    #[internal_api]
-    pub(crate) fn for_snapshot(
-        storage: &dyn StorageHandler,
-        log_root: Url,
-        checkpoint_hint: impl Into<Option<LastCheckpointHint>>,
-        time_travel_version: impl Into<Option<Version>>,
+    /// This will list the entire log directory and find all relevant files for the given table version.
+    pub async fn try_new(
+        table_root: &Path,
+        version: Option<i64>,
+        store: &dyn ObjectStore,
     ) -> DeltaResult<Self> {
-        let time_travel_version = time_travel_version.into();
+        dbg!("Reading log segment");
 
-        let listed_files = match (checkpoint_hint.into(), time_travel_version) {
-            (Some(cp), None) => {
-                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, None)?
+        let log_url = table_root.child("_delta_log");
+        let maybe_cp = read_last_checkpoint(store, &log_url).await?;
+
+        // List relevant files from log
+        let (mut commit_files, checkpoint_files) = match (maybe_cp, version) {
+            (Some(cp), None) => list_log_files_with_checkpoint(&cp, store, &log_url).await?,
+            (Some(cp), Some(v)) if cp.version <= v => {
+                list_log_files_with_checkpoint(&cp, store, &log_url).await?
             }
-            (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                ListedLogFiles::list_with_checkpoint_hint(
-                    &cp,
-                    storage,
-                    &log_root,
-                    Some(end_version),
-                )?
-            }
-            _ => ListedLogFiles::list(storage, &log_root, None, time_travel_version)?,
+            _ => list_log_files(store, &log_url, version, None).await?,
         };
+        dbg!(&checkpoint_files);
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version)
-    }
+        // remove all files above requested version
+        if let Some(version) = version {
+            commit_files.retain(|meta| meta.location.commit_version() <= Some(version));
+        }
 
-    /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between versions
-    /// `start_version` and `end_version`: Its LogSegment is made of zero checkpoints and all commits
-    /// between versions `start_version` (inclusive) and `end_version` (inclusive). If no `end_version`
-    /// is specified it will be the most recent version by default.
-    #[internal_api]
-    pub(crate) fn for_table_changes(
-        storage: &dyn StorageHandler,
-        log_root: Url,
-        start_version: Version,
-        end_version: impl Into<Option<Version>>,
-    ) -> DeltaResult<Self> {
-        let end_version = end_version.into();
-        if let Some(end_version) = end_version {
-            if start_version > end_version {
-                return Err(Error::generic(
-                    "Failed to build LogSegment: start_version cannot be greater than end_version",
-                ));
+        let mut segment = Self {
+            version: 0,
+            commit_files: commit_files.into(),
+            checkpoint_files,
+        };
+        if segment.commit_files.is_empty() && segment.checkpoint_files.is_empty() {
+            return Err(DeltaTableError::NotATable("no log files".into()));
+        }
+        // get the effective version from chosen files
+        let version_eff = segment.file_version().ok_or(DeltaTableError::Generic(
+            "failed to get effective version".into(),
+        ))?; // TODO: A more descriptive error
+        segment.version = version_eff;
+        segment.validate()?;
+
+        if let Some(v) = version {
+            if version_eff != v {
+                // TODO more descriptive error
+                return Err(DeltaTableError::Generic("missing version".into()));
             }
         }
 
-        // TODO: compactions?
-        let listed_files =
-            ListedLogFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
-        // - Here check that the start version is correct.
-        // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
-        // - [`ListedLogFiles::list_commits`] also checks that there are no gaps between commits.
-        // If all three are satisfied, this implies that all the desired commits are present.
-        require!(
-            listed_files
-                .ascending_commit_files
+        Ok(segment)
+    }
+
+    /// Try to create a new [`LogSegment`] from a slice of the log.
+    ///
+    /// This will create a new [`LogSegment`] from the log with all relevant log files
+    /// starting at `start_version` and ending at `end_version`.
+    pub async fn try_new_slice(
+        table_root: &Path,
+        start_version: i64,
+        end_version: Option<i64>,
+        log_store: &dyn LogStore,
+    ) -> DeltaResult<Self> {
+        debug!("try_new_slice: start_version: {start_version}, end_version: {end_version:?}",);
+        log_store.refresh().await?;
+        let log_url = table_root.child("_delta_log");
+        let (mut commit_files, checkpoint_files) = list_log_files(
+            log_store.object_store(None).as_ref(),
+            &log_url,
+            end_version,
+            Some(start_version),
+        )
+        .await?;
+        // remove all files above requested version
+        if let Some(version) = end_version {
+            commit_files.retain(|meta| meta.location.commit_version() <= Some(version));
+        }
+        let mut segment = Self {
+            version: start_version,
+            commit_files: commit_files.into(),
+            checkpoint_files,
+        };
+        segment.version = segment
+            .file_version()
+            .unwrap_or(end_version.unwrap_or(start_version));
+        Ok(segment)
+    }
+
+    pub fn validate(&self) -> DeltaResult<()> {
+        let checkpoint_version = self
+            .checkpoint_files
+            .iter()
+            .filter_map(|f| f.location.commit_version())
+            .max();
+        if let Some(v) = checkpoint_version {
+            if !self
+                .commit_files
+                .iter()
+                .all(|f| f.location.commit_version() > Some(v))
+            {
+                return Err(DeltaTableError::Generic("inconsistent log segment".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the highest commit version number in the log segment
+    pub fn file_version(&self) -> Option<i64> {
+        self.commit_files
+            .iter()
+            .filter_map(|f| f.location.commit_version())
+            .max()
+            .or(self
+                .checkpoint_files
                 .first()
-                .is_some_and(|first_commit| first_commit.version == start_version),
-            Error::generic(format!(
-                "Expected the first commit to have version {start_version}"
-            ))
-        );
-        LogSegment::try_new(listed_files, log_root, end_version)
+                .and_then(|f| f.location.commit_version()))
     }
 
-    #[allow(unused)]
-    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
-    /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
-    /// `limit` specifies the maximum length of the returned log segment. The log segment may be
-    /// shorter than `limit` if there are missing commits.
-    ///
-    // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
-    // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
-    pub(crate) fn for_timestamp_conversion(
-        storage: &dyn StorageHandler,
-        log_root: Url,
-        end_version: Version,
-        limit: Option<NonZero<usize>>,
-    ) -> DeltaResult<Self> {
-        // Compute the version to start listing from.
-        let start_from = limit
-            .map(|limit| match NonZero::<Version>::try_from(limit) {
-                Ok(limit) => Ok(Version::saturating_sub(end_version, limit.get() - 1)),
-                _ => Err(Error::generic(format!(
-                    "Invalid limit {limit} when building log segment in timestamp conversion",
-                ))),
-            })
-            .transpose()?;
-
-        // this is a list of commits with possible gaps, we want to take the latest contiguous
-        // chunk of commits
-        let mut listed_commits =
-            ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
-
-        // remove gaps - return latest contiguous chunk of commits
-        let commits = &mut listed_commits.ascending_commit_files;
-        if !commits.is_empty() {
-            let mut start_idx = commits.len() - 1;
-            while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version
-            {
-                start_idx -= 1;
-            }
-            commits.drain(..start_idx);
-        }
-
-        LogSegment::try_new(listed_commits, log_root, Some(end_version))
-    }
-
-    /// Read a stream of actions from this log segment. This returns an iterator of
-    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
-    /// the data was read from a commit file (true) or a checkpoint file (false).
-    ///
-    /// The log files will be read from most recent to oldest.
-    ///
-    /// `commit_read_schema` is the (physical) schema to read the commit files with, and
-    /// `checkpoint_read_schema` is the (physical) schema to read checkpoint files with. This can be
-    /// used to project the log files to a subset of the columns.
-    ///
-    /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
-    /// query's predicate, but rather a predicate for filtering log files themselves.
-    #[internal_api]
-    pub(crate) fn read_actions(
-        &self,
-        engine: &dyn Engine,
-        commit_read_schema: SchemaRef,
-        checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        // `replay` expects commit files to be sorted in descending order, so the return value here is correct
-        let commits_and_compactions = self.find_commit_cover();
-        let commit_stream = engine
-            .json_handler()
-            .read_json_files(
-                &commits_and_compactions,
-                commit_read_schema,
-                meta_predicate.clone(),
+    #[cfg(test)]
+    pub(super) fn new_test<'a>(
+        commits: impl IntoIterator<Item = &'a CommitData>,
+    ) -> DeltaResult<(Self, Vec<Result<RecordBatch, DeltaTableError>>)> {
+        let mut log = Self {
+            version: -1,
+            commit_files: Default::default(),
+            checkpoint_files: Default::default(),
+        };
+        let iter = log
+            .advance(
+                commits,
+                &Path::default(),
+                crate::kernel::models::fields::log_schema(),
+                &Default::default(),
             )?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
-
-        let checkpoint_stream =
-            self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
-
-        Ok(commit_stream.chain(checkpoint_stream))
+            .collect_vec();
+        Ok((log, iter))
     }
 
-    /// find a minimal set to cover the range of commits we want. This is greedy so not always
-    /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
-    /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
-    /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
-    /// range for this log segment. This invariant is maintained by our listing code.
-    fn find_commit_cover(&self) -> Vec<FileMeta> {
-        // Create an iterator sorted in ascending order by (initial version, end version), e.g.
-        // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
-        //  10.19.compacted.json, 11.json, ...]
-        let all_files = itertools::Itertools::merge_by(
-            self.ascending_commit_files.iter(),
-            self.ascending_compaction_files.iter(),
-            |path_a, path_b| path_a.version <= path_b.version,
-        );
-
-        let mut last_pushed: Option<&ParsedLogPath> = None;
-
-        let mut selected_files = vec![];
-        for next in all_files {
-            match last_pushed {
-                // Resolve version number ties in favor of the later file (it covers a wider range)
-                Some(prev) if prev.version == next.version => {
-                    let removed = selected_files.pop();
-                    debug!("Selecting {next:?} rather than {removed:?}, it covers a wider range");
-                }
-                // Skip later files whose start overlaps with the previous end
-                Some(&ParsedLogPath {
-                    file_type: LogPathFileType::CompactedCommit { hi },
-                    ..
-                }) if next.version <= hi => {
-                    debug!("Skipping log file {next:?}, it's already covered.");
-                    continue;
-                }
-                _ => {} // just fall through
-            }
-            debug!("Provisionally selecting {next:?}");
-            last_pushed = Some(next);
-            selected_files.push(next.location.clone());
-        }
-        selected_files.reverse();
-        selected_files
+    pub fn version(&self) -> i64 {
+        self.version
     }
 
-    /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
-    ///
-    /// By default, `create_checkpoint_stream` checks for the presence of sidecar files, and
-    /// reads their contents if present. Checking for sidecar files is skipped if:
-    /// - The checkpoint is a multi-part checkpoint
-    /// - The checkpoint read schema does not contain a file action
-    ///
-    /// For single-part checkpoints, any referenced sidecar files are processed. These
-    /// sidecar files contain the actual file actions that would otherwise be
-    /// stored directly in the checkpoint. The sidecar file batches are chained to the
-    /// checkpoint batch in the top level iterator to be returned.
-    fn create_checkpoint_stream(
-        &self,
-        engine: &dyn Engine,
-        checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
-            || checkpoint_read_schema.contains(REMOVE_NAME);
-        require!(
-            !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
-            Error::invalid_checkpoint(
-                "If the checkpoint read schema contains file actions, it must contain the sidecar column"
-            )
-        );
-
-        let checkpoint_file_meta: Vec<_> = self
-            .checkpoint_parts
+    /// Returns the last modified timestamp for a commit file with the given version
+    pub fn version_timestamp(&self, version: i64) -> Option<chrono::DateTime<Utc>> {
+        self.commit_files
             .iter()
-            .map(|f| f.location.clone())
-            .collect();
+            .find(|f| f.location.commit_version() == Some(version))
+            .map(|f| f.last_modified)
+    }
 
-        let parquet_handler = engine.parquet_handler();
+    pub(super) fn commit_stream(
+        &self,
+        store: Arc<dyn ObjectStore>,
+        read_schema: &Schema,
+        config: &DeltaTableConfig,
+    ) -> DeltaResult<BoxStream<'_, DeltaResult<RecordBatch>>> {
+        let decoder = json::get_decoder(Arc::new(read_schema.try_into()?), config)?;
+        let stream = futures::stream::iter(self.commit_files.iter())
+            .map(move |meta| {
+                let store = store.clone();
+                async move { store.get(&meta.location).await?.bytes().await }
+            })
+            .buffered(config.log_buffer_size);
+        Ok(json::decode_stream(decoder, stream).boxed())
+    }
 
-        // Historically, we had a shared file reader trait for JSON and Parquet handlers,
-        // but it was removed to avoid unnecessary coupling. This is a concrete case
-        // where it *could* have been useful, but for now, we're keeping them separate.
-        // If similar patterns start appearing elsewhere, we should reconsider that decision.
-        let actions = match self.checkpoint_parts.first() {
-            Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                engine.json_handler().read_json_files(
-                    &checkpoint_file_meta,
-                    checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
-                )?
+    pub(super) fn checkpoint_stream(
+        &self,
+        store: Arc<dyn ObjectStore>,
+        read_schema: &Schema,
+        config: &DeltaTableConfig,
+    ) -> BoxStream<'_, DeltaResult<RecordBatch>> {
+        let batch_size = config.log_batch_size;
+        dbg!("checkpoint_stream");
+        dbg!(&batch_size);
+        let read_schema = Arc::new(read_schema.clone());
+        futures::stream::iter(self.checkpoint_files.clone())
+            .map(move |meta| {
+                let store = store.clone();
+                let read_schema = read_schema.clone();
+                async move {
+                    dbg!(&meta.clone());
+
+                    let mut reader = ParquetObjectReader::new(store, meta);
+                    let options = ArrowReaderOptions::new();
+                    let reader_meta = ArrowReaderMetadata::load_async(&mut reader, options).await?;
+
+                    // Create projection selecting read_schema fields from parquet file's arrow schema
+                    let projection = reader_meta
+                        .schema()
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, f)| {
+                            if read_schema.fields.contains_key(f.name()) {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let projection =
+                        ProjectionMask::roots(reader_meta.parquet_schema(), projection);
+
+                    // Note: the output batch stream batches have all null value rows for action types not
+                    // present in the projection. When a RowFilter was used to remove null rows, the performance
+                    // got worse when projecting all fields, and was no better when projecting a subset.
+                    // The all null rows are filtered out anyway when the batch stream is consumed.
+                    ParquetRecordBatchStreamBuilder::new_with_metadata(reader, reader_meta)
+                        .with_projection(projection.clone())
+                        .with_batch_size(batch_size)
+                        .build()
+                }
+            })
+            .buffered(config.log_buffer_size)
+            .try_flatten()
+            .map_err(Into::into)
+            .boxed()
+    }
+
+    /// Read [`Protocol`] and [`Metadata`] actions
+    pub(super) async fn read_metadata(
+        &self,
+        store: Arc<dyn ObjectStore>,
+        config: &DeltaTableConfig,
+    ) -> DeltaResult<(Option<Protocol>, Option<Metadata>)> {
+        static READ_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
+            StructType::new(vec![
+                ActionType::Protocol.schema_field().clone(),
+                ActionType::Metadata.schema_field().clone(),
+            ])
+        });
+
+        let mut maybe_protocol = None;
+        let mut maybe_metadata = None;
+
+        let mut commit_stream = self.commit_stream(store.clone(), &READ_SCHEMA, config)?;
+        while let Some(batch) = commit_stream.next().await {
+            let batch = batch?;
+            if maybe_protocol.is_none() {
+                if let Some(p) = parse::read_protocol(&batch)? {
+                    maybe_protocol.replace(p);
+                };
             }
-            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
-                .read_parquet_files(
-                    &checkpoint_file_meta,
-                    checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
-                )?,
-            Some(parsed_log_path) => {
-                return Err(Error::generic(format!(
-                    "Unsupported checkpoint file type: {}",
-                    parsed_log_path.extension,
-                )));
+            if maybe_metadata.is_none() {
+                if let Some(m) = parse::read_metadata(&batch)? {
+                    maybe_metadata.replace(m);
+                };
             }
-            // This is the case when there are no checkpoints in the log segment
-            // so we return an empty iterator
-            None => Box::new(std::iter::empty()),
+            if maybe_protocol.is_some() && maybe_metadata.is_some() {
+                return Ok((maybe_protocol, maybe_metadata));
+            }
+        }
+        dbg!("Starting parquet checkpoint stream reader");
+        let start = Instant::now();
+        let mut checkpoint_stream = self.checkpoint_stream(store.clone(), &READ_SCHEMA, config);
+        while let Some(batch) = checkpoint_stream.next().await {
+            let batch = batch?;
+            dbg!("Stream batch time: {:?}", start.elapsed());
+            if maybe_protocol.is_none() {
+                if let Some(p) = parse::read_protocol(&batch)? {
+                    maybe_protocol.replace(p);
+                };
+            }
+            if maybe_metadata.is_none() {
+                if let Some(m) = parse::read_metadata(&batch)? {
+                    maybe_metadata.replace(m);
+                };
+            }
+            if maybe_protocol.is_some() && maybe_metadata.is_some() {
+                return Ok((maybe_protocol, maybe_metadata));
+            }
+        }
+        dbg!("Finished parquet checkpoint stream reader");
+
+        Ok((maybe_protocol, maybe_metadata))
+    }
+
+    /// Advance the log segment with new commits
+    ///
+    /// Returns an iterator over record batches, as if the commits were read from the log.
+    /// The input commits should be in order in which they would be committed to the table.
+    pub(super) fn advance<'a>(
+        &mut self,
+        commits: impl IntoIterator<Item = &'a CommitData>,
+        table_root: &Path,
+        read_schema: &Schema,
+        config: &DeltaTableConfig,
+    ) -> DeltaResult<impl Iterator<Item = Result<RecordBatch, DeltaTableError>> + '_> {
+        let log_path = table_root.child("_delta_log");
+        let mut decoder = json::get_decoder(Arc::new(read_schema.try_into()?), config)?;
+
+        let mut commit_data = Vec::new();
+        for commit in commits {
+            self.version += 1;
+            let path = log_path.child(format!("{:020}.json", self.version));
+            let bytes = commit.get_bytes()?;
+            let meta = ObjectMeta {
+                location: path,
+                size: bytes.len(),
+                last_modified: Utc::now(),
+                e_tag: None,
+                version: None,
+            };
+            // NOTE: We always assume the commit files are sorted in reverse order
+            self.commit_files.push_front(meta);
+            let reader = json::get_reader(&bytes);
+            let batches =
+                json::decode_reader(&mut decoder, reader).collect::<Result<Vec<_>, _>>()?;
+            commit_data.push(batches);
+        }
+
+        // NOTE: Most recent commits need to be processed first
+        commit_data.reverse();
+        Ok(commit_data.into_iter().flatten().map(Ok))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckpointMetadata {
+    /// The version of the table when the last checkpoint was made.
+    #[allow(unreachable_pub)] // used by acceptance tests (TODO make an fn accessor?)
+    pub version: i64,
+    /// The number of actions that are stored in the checkpoint.
+    pub(crate) size: i64,
+    /// The number of fragments if the last checkpoint was written in multiple parts.
+    pub(crate) parts: Option<i32>,
+    /// The number of bytes of the checkpoint.
+    pub(crate) size_in_bytes: Option<i64>,
+    /// The number of AddFile actions in the checkpoint.
+    pub(crate) num_of_add_files: Option<i64>,
+    /// The schema of the checkpoint file.
+    pub(crate) checkpoint_schema: Option<Schema>,
+    /// The checksum of the last checkpoint JSON.
+    pub(crate) checksum: Option<String>,
+}
+
+/// Try reading the `_last_checkpoint` file.
+///
+/// In case the file is not found, `None` is returned.
+async fn read_last_checkpoint(
+    fs_client: &dyn ObjectStore,
+    log_root: &Path,
+) -> DeltaResult<Option<CheckpointMetadata>> {
+    let file_path = log_root.child(LAST_CHECKPOINT_FILE_NAME);
+    match fs_client.get(&"something").await {
+        Ok(data) => {
+            let start = Instant::now();
+            let data = data.bytes().await?;
+            let slice = Some(serde_json::from_slice(&data)?);
+            dbg!("read_last_checkpoint: {:?}", start.elapsed());
+            Ok(slice)
+        }
+        Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+
+    match fs_client.get(&file_path).await {
+        Ok(data) => {
+            let start = Instant::now();
+            let data = data.bytes().await?;
+            let slice = Some(serde_json::from_slice(&data)?);
+            dbg!("read_last_checkpoint: {:?}", start.elapsed());
+            Ok(slice)
+        }
+        Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// List all log files after a given checkpoint.
+async fn list_log_files_with_checkpoint(
+    cp: &CheckpointMetadata,
+    fs_client: &dyn ObjectStore,
+    log_root: &Path,
+) -> DeltaResult<(Vec<ObjectMeta>, Vec<ObjectMeta>)> {
+    let version_prefix = format!("{:020}", cp.version);
+    let start_from = log_root.child(version_prefix.as_str());
+
+    let list_start = Instant::now();
+    let files = fs_client
+        .list_with_offset(Some(log_root), &start_from)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
+        .filter(|f| f.location.commit_version().is_some())
+        .collect::<Vec<_>>();
+    dbg!("list_start time: {:?}", list_start.elapsed());
+
+    let mut commit_files = files
+        .iter()
+        .filter_map(|f| {
+            if f.location.is_commit_file() && f.location.commit_version() > Some(cp.version) {
+                Some(f.clone())
+            } else {
+                None
+            }
+        })
+        .collect_vec();
+
+    // NOTE: this will sort in reverse order
+    commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
+
+    let checkpoint_files_start = Instant::now();
+    let checkpoint_files = files
+        .iter()
+        .filter_map(|f| {
+            if f.location.is_checkpoint_file() && f.location.commit_version() == Some(cp.version) {
+                Some(f.clone())
+            } else {
+                None
+            }
+        })
+        .collect_vec();
+    dbg!(
+        "checkpoint_files time: {:?}",
+        checkpoint_files_start.elapsed()
+    );
+
+    if checkpoint_files.len() != cp.parts.unwrap_or(1) as usize {
+        let msg = format!(
+            "Number of checkpoint files '{}' is not equal to number of checkpoint metadata parts '{:?}'",
+            checkpoint_files.len(),
+            cp.parts
+        );
+        Err(DeltaTableError::MetadataError(msg))
+    } else {
+        Ok((commit_files, checkpoint_files))
+    }
+}
+
+/// List relevant log files.
+///
+/// Relevant files are the max checkpoint found and all subsequent commits.
+pub(super) async fn list_log_files(
+    fs_client: &dyn ObjectStore,
+    log_root: &Path,
+    max_version: Option<i64>,
+    start_version: Option<i64>,
+) -> DeltaResult<(Vec<ObjectMeta>, Vec<ObjectMeta>)> {
+    let max_version = max_version.unwrap_or(i64::MAX - 1);
+    let start_from = log_root.child(format!("{:020}", start_version.unwrap_or(0)).as_str());
+
+    let mut max_checkpoint_version = -1_i64;
+    let mut commit_files = Vec::with_capacity(25);
+    let mut checkpoint_files = Vec::with_capacity(10);
+
+    for meta in fs_client
+        .list_with_offset(Some(log_root), &start_from)
+        .try_collect::<Vec<_>>()
+        .await?
+    {
+        if meta.location.commit_version().unwrap_or(i64::MAX) <= max_version
+            && meta.location.commit_version() >= start_version
+        {
+            if meta.location.is_checkpoint_file() {
+                let version = meta.location.commit_version().unwrap_or(0);
+                match version.cmp(&max_checkpoint_version) {
+                    Ordering::Greater => {
+                        max_checkpoint_version = version;
+                        checkpoint_files.clear();
+                        checkpoint_files.push(meta);
+                    }
+                    Ordering::Equal => {
+                        checkpoint_files.push(meta);
+                    }
+                    _ => {}
+                }
+            } else if meta.location.is_commit_file() {
+                commit_files.push(meta);
+            }
+        }
+    }
+
+    commit_files.retain(|f| f.location.commit_version().unwrap_or(0) > max_checkpoint_version);
+    // NOTE this will sort in reverse order
+    commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
+
+    Ok((commit_files, checkpoint_files))
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use delta_kernel::table_features::{ReaderFeatures, WriterFeatures};
+    use deltalake_test::utils::*;
+    use maplit::hashset;
+    use tokio::task::JoinHandle;
+
+    use crate::{
+        checkpoints::{create_checkpoint_for, create_checkpoint_from_table_uri_and_cleanup},
+        kernel::{Action, Add, Format, Remove},
+        operations::transaction::{CommitBuilder, TableReference},
+        protocol::{DeltaOperation, SaveMode},
+        DeltaTableBuilder,
+    };
+
+    use super::*;
+
+    pub(crate) async fn test_log_segment(context: &IntegrationContext) -> TestResult {
+        read_log_files(context).await?;
+        read_metadata(context).await?;
+        log_segment_serde(context).await?;
+
+        Ok(())
+    }
+
+    async fn log_segment_serde(context: &IntegrationContext) -> TestResult {
+        let store = context
+            .table_builder(TestTables::Simple)
+            .build_storage()?
+            .object_store(None);
+
+        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
+        let bytes = serde_json::to_vec(&segment).unwrap();
+        let actual: LogSegment = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(actual.version(), segment.version());
+        assert_eq!(actual.commit_files.len(), segment.commit_files.len());
+        assert_eq!(
+            actual.checkpoint_files.len(),
+            segment.checkpoint_files.len()
+        );
+
+        Ok(())
+    }
+
+    async fn read_log_files(context: &IntegrationContext) -> TestResult {
+        let store = context
+            .table_builder(TestTables::SimpleWithCheckpoint)
+            .build_storage()?
+            .object_store(None);
+
+        let log_path = Path::from("_delta_log");
+        let cp = read_last_checkpoint(store.as_ref(), &log_path)
+            .await?
+            .unwrap();
+        assert_eq!(cp.version, 10);
+
+        let (log, check) = list_log_files_with_checkpoint(&cp, store.as_ref(), &log_path).await?;
+        assert_eq!(log.len(), 0);
+        assert_eq!(check.len(), 1);
+
+        let (log, check) = list_log_files(store.as_ref(), &log_path, None, None).await?;
+        assert_eq!(log.len(), 0);
+        assert_eq!(check.len(), 1);
+
+        let (log, check) = list_log_files(store.as_ref(), &log_path, Some(8), None).await?;
+        assert_eq!(log.len(), 9);
+        assert_eq!(check.len(), 0);
+
+        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
+        assert_eq!(segment.version, 10);
+        assert_eq!(segment.commit_files.len(), 0);
+        assert_eq!(segment.checkpoint_files.len(), 1);
+
+        let segment = LogSegment::try_new(&Path::default(), Some(8), store.as_ref()).await?;
+        assert_eq!(segment.version, 8);
+        assert_eq!(segment.commit_files.len(), 9);
+        assert_eq!(segment.checkpoint_files.len(), 0);
+
+        let store = context
+            .table_builder(TestTables::Simple)
+            .build_storage()?
+            .object_store(None);
+
+        let (log, check) = list_log_files(store.as_ref(), &log_path, None, None).await?;
+        assert_eq!(log.len(), 5);
+        assert_eq!(check.len(), 0);
+
+        let (log, check) = list_log_files(store.as_ref(), &log_path, Some(2), None).await?;
+        assert_eq!(log.len(), 3);
+        assert_eq!(check.len(), 0);
+
+        Ok(())
+    }
+
+    async fn read_metadata(context: &IntegrationContext) -> TestResult {
+        let store = context
+            .table_builder(TestTables::WithDvSmall)
+            .build_storage()?
+            .object_store(None);
+        let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
+        let (protocol, _metadata) = segment
+            .read_metadata(store.clone(), &Default::default())
+            .await?;
+        let protocol = protocol.unwrap();
+
+        let expected = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(hashset! {ReaderFeatures::DeletionVectors}),
+            writer_features: Some(hashset! {WriterFeatures::DeletionVectors}),
+        };
+        assert_eq!(protocol, expected);
+
+        Ok(())
+    }
+
+    pub(crate) async fn concurrent_checkpoint(context: &IntegrationContext) -> TestResult {
+        context
+            .load_table(TestTables::LatestNotCheckpointed)
+            .await?;
+        let table_to_checkpoint = context
+            .table_builder(TestTables::LatestNotCheckpointed)
+            .load()
+            .await?;
+        let store = context
+            .table_builder(TestTables::LatestNotCheckpointed)
+            .build_storage()?
+            .object_store(None);
+        let slow_list_store = Arc::new(slow_store::SlowListStore { store });
+
+        let version = table_to_checkpoint.version();
+        let load_task: JoinHandle<Result<LogSegment, DeltaTableError>> = tokio::spawn(async move {
+            let segment =
+                LogSegment::try_new(&Path::default(), Some(version), slow_list_store.as_ref())
+                    .await?;
+            Ok(segment)
+        });
+
+        create_checkpoint_from_table_uri_and_cleanup(
+            &table_to_checkpoint.table_uri(),
+            version,
+            Some(false),
+            None,
+        )
+        .await?;
+
+        let segment = load_task.await??;
+        assert_eq!(segment.version, version);
+
+        Ok(())
+    }
+
+    mod slow_store {
+        use std::sync::Arc;
+
+        use futures::stream::BoxStream;
+        use object_store::{
+            path::Path, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+            ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
         };
 
-        let log_root = self.log_root.clone();
-
-        let actions_iter = actions
-            .map(move |checkpoint_batch_result| -> DeltaResult<_> {
-                let checkpoint_batch = checkpoint_batch_result?;
-                // This closure maps the checkpoint batch to an iterator of batches
-                // by chaining the checkpoint batch with sidecar batches if they exist.
-
-                // 1. In the case where the schema does not contain file actions, we return the
-                //    checkpoint batch directly as sidecar files only have to be read when the
-                //    schema contains add/remove action.
-                // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is
-                //    returned as-is.
-                let sidecar_content = if need_file_actions && checkpoint_file_meta.len() == 1 {
-                    Self::process_sidecars(
-                        parquet_handler.clone(), // cheap Arc clone
-                        log_root.clone(),
-                        checkpoint_batch.as_ref(),
-                        checkpoint_read_schema.clone(),
-                        meta_predicate.clone(),
-                    )?
-                } else {
-                    None
-                };
-
-                let combined_batches = std::iter::once(Ok(checkpoint_batch))
-                    .chain(sidecar_content.into_iter().flatten())
-                    // The boolean flag indicates whether the batch originated from a commit file
-                    // (true) or a checkpoint file (false).
-                    .map_ok(|sidecar_batch| ActionsBatch::new(sidecar_batch, false));
-
-                Ok(combined_batches)
-            })
-            .flatten_ok()
-            .map(|result| result?); // result-result to result
-
-        Ok(actions_iter)
-    }
-
-    /// Processes sidecar files for the given checkpoint batch.
-    ///
-    /// This function extracts any sidecar file references from the provided batch.
-    /// Each sidecar file is read and an iterator of file action batches is returned
-    fn process_sidecars(
-        parquet_handler: Arc<dyn ParquetHandler>,
-        log_root: Url,
-        batch: &dyn EngineData,
-        checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
-        // Visit the rows of the checkpoint batch to extract sidecar file references
-        let mut visitor = SidecarVisitor::default();
-        visitor.visit_rows_of(batch)?;
-
-        // If there are no sidecar files, return early
-        if visitor.sidecars.is_empty() {
-            return Ok(None);
+        #[derive(Debug)]
+        pub(super) struct SlowListStore {
+            pub store: Arc<dyn ObjectStore>,
         }
 
-        let sidecar_files: Vec<_> = visitor
-            .sidecars
-            .iter()
-            .map(|sidecar| sidecar.to_filemeta(&log_root))
-            .try_collect()?;
-
-        // Read the sidecar files and return an iterator of sidecar file batches
-        Ok(Some(parquet_handler.read_parquet_files(
-            &sidecar_files,
-            checkpoint_read_schema,
-            meta_predicate,
-        )?))
-    }
-
-    // Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
-    // the LogSegment
-    pub(crate) fn protocol_and_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let actions_batches = self.replay_for_metadata(engine)?;
-        let (mut metadata_opt, mut protocol_opt) = (None, None);
-        for actions_batch in actions_batches {
-            let actions = actions_batch?.actions;
-            if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            }
-            if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
-            }
-            if metadata_opt.is_some() && protocol_opt.is_some() {
-                // we've found both, we can stop
-                break;
+        impl std::fmt::Display for SlowListStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "SlowListStore {{ store: {} }}", self.store)
             }
         }
-        Ok((metadata_opt, protocol_opt))
-    }
 
-    // Get the most up-to-date Protocol and Metadata actions
-    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
-        match self.protocol_and_metadata(engine)? {
-            (Some(m), Some(p)) => Ok((m, p)),
-            (None, Some(_)) => Err(Error::MissingMetadata),
-            (Some(_), None) => Err(Error::MissingProtocol),
-            (None, None) => Err(Error::MissingMetadataAndProtocol),
+        #[async_trait::async_trait]
+        impl object_store::ObjectStore for SlowListStore {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                bytes: PutPayload,
+                opts: PutOptions,
+            ) -> Result<PutResult> {
+                self.store.put_opts(location, bytes, opts).await
+            }
+            async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
+                self.store.put_multipart(location).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: PutMultipartOpts,
+            ) -> Result<Box<dyn MultipartUpload>> {
+                self.store.put_multipart_opts(location, opts).await
+            }
+
+            async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+                self.store.get_opts(location, options).await
+            }
+
+            async fn delete(&self, location: &Path) -> Result<()> {
+                self.store.delete(location).await
+            }
+
+            fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                self.store.list(prefix)
+            }
+
+            async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+                self.store.list_with_delimiter(prefix).await
+            }
+
+            async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+                self.store.copy(from, to).await
+            }
+
+            async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+                self.store.copy_if_not_exists(from, to).await
+            }
         }
     }
 
-    // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
-    fn replay_for_metadata(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-            Some(Arc::new(Predicate::or(
-                Expression::column([METADATA_NAME, "id"]).is_not_null(),
-                Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
-            )))
-        });
-        // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema.clone(), schema, META_PREDICATE.clone())
+    #[test]
+    pub fn is_commit_file_only_matches_commits() {
+        for path in [0, 1, 5, 10, 100, i64::MAX]
+            .into_iter()
+            .map(crate::storage::commit_uri_from_version)
+        {
+            assert!(path.is_commit_file());
+        }
+
+        let not_commits = ["_delta_log/_commit_2132c4fe-4077-476c-b8f5-e77fea04f170.json.tmp"];
+
+        for not_commit in not_commits {
+            let path = Path::from(not_commit);
+            assert!(!path.is_commit_file());
+        }
     }
 
-    /// How many commits since a checkpoint, according to this log segment
-    pub(crate) fn commits_since_checkpoint(&self) -> u64 {
-        // we can use 0 as the checkpoint version if there is no checkpoint since `end_version - 0`
-        // is the correct number of commits since a checkpoint if there are no checkpoints
-        let checkpoint_version = self.checkpoint_version.unwrap_or(0);
-        debug_assert!(checkpoint_version <= self.end_version);
-        self.end_version - checkpoint_version
-    }
+    #[tokio::test]
+    async fn test_checkpoint_stream_parquet_read() {
+        let metadata = Metadata {
+            id: "test".to_string(),
+            format: Format::new("parquet".to_string(), None),
+            schema_string: r#"{"type":"struct",  "fields": []}"#.to_string(),
+            ..Default::default()
+        };
+        let protocol = Protocol::default();
 
-    /// How many commits since a log-compaction or checkpoint, according to this log segment
-    pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> u64 {
-        // Annoyingly we have to search all the compaction files to determine this, because we only
-        // sort by start version, so technically the max end version could be anywhere in the vec.
-        // We can return 0 in the case there is no compaction since end_version - 0 is the correct
-        // number of commits since compaction if there are no compactions
-        let max_compaction_end = self.ascending_compaction_files.iter().fold(0, |cur, f| {
-            if let &ParsedLogPath {
-                file_type: LogPathFileType::CompactedCommit { hi },
-                ..
-            } = f
-            {
-                Version::max(cur, hi)
-            } else {
-                warn!("Found invalid ParsedLogPath in ascending_compaction_files: {f:?}");
-                cur
-            }
-        });
-        // we want to subtract off the max of the max compaction end or the checkpoint version
-        let to_sub = Version::max(self.checkpoint_version.unwrap_or(0), max_compaction_end);
-        debug_assert!(to_sub <= self.end_version);
-        self.end_version - to_sub
+        let mut actions = vec![Action::Metadata(metadata), Action::Protocol(protocol)];
+        for i in 0..10 {
+            actions.push(Action::Add(Add {
+                path: format!("part-{i}.parquet"),
+                modification_time: chrono::Utc::now().timestamp_millis(),
+                ..Default::default()
+            }));
+        }
+
+        let log_store = DeltaTableBuilder::from_uri("memory:///")
+            .build_storage()
+            .unwrap();
+        let op = DeltaOperation::Write {
+            mode: SaveMode::Overwrite,
+            partition_by: None,
+            predicate: None,
+        };
+        let commit = CommitBuilder::default()
+            .with_actions(actions)
+            .build(None, log_store.clone(), op)
+            .await
+            .unwrap();
+
+        let mut actions = Vec::new();
+        // remove all but one file
+        for i in 0..9 {
+            actions.push(Action::Remove(Remove {
+                path: format!("part-{i}.parquet"),
+                deletion_timestamp: Some(chrono::Utc::now().timestamp_millis()),
+                ..Default::default()
+            }))
+        }
+
+        let op = DeltaOperation::Delete { predicate: None };
+        let table_data = &commit.snapshot as &dyn TableReference;
+        let commit = CommitBuilder::default()
+            .with_actions(actions)
+            .build(Some(table_data), log_store.clone(), op)
+            .await
+            .unwrap();
+
+        create_checkpoint_for(commit.version, &commit.snapshot, log_store.as_ref(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(commit.metrics.num_retries, 0);
+        assert_eq!(commit.metrics.num_log_files_cleaned_up, 0);
+        assert!(!commit.metrics.new_checkpoint_created);
+
+        let batches = LogSegment::try_new(
+            &Path::default(),
+            Some(commit.version),
+            log_store.object_store(None).as_ref(),
+        )
+        .await
+        .unwrap()
+        .checkpoint_stream(
+            log_store.object_store(None),
+            &StructType::new(vec![
+                ActionType::Metadata.schema_field().clone(),
+                ActionType::Protocol.schema_field().clone(),
+                ActionType::Add.schema_field().clone(),
+            ]),
+            &Default::default(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
+
+        // there are 9 remove action rows but all columns are null
+        // because the removes are not projected in the schema
+        // these get filtered out upstream and there was no perf
+        // benefit when applying a row filter
+        // in addition there is 1 add, 1 metadata, and 1 protocol row
+        assert_eq!(batch.num_rows(), 12);
+
+        assert_eq!(batch.schema().fields().len(), 3);
+        assert!(batch.schema().field_with_name("metaData").is_ok());
+        assert!(batch.schema().field_with_name("protocol").is_ok());
+        assert!(batch.schema().field_with_name("add").is_ok());
     }
 }
